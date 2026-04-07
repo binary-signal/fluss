@@ -963,115 +963,70 @@ public class BinaryArrayTest {
     }
 
     @Test
-    public void testToDoubleArrayWithLargeArray() {
-        // Test with 20 elements to verify fix for ArrayIndexOutOfBoundsException
-        double[] input = new double[20];
-        for (int i = 0; i < 20; i++) {
-            input[i] = i * 1.1;
-        }
-        BinaryArray binaryArray = BinaryArray.fromPrimitiveArray(input);
-
-        double[] result = binaryArray.toDoubleArray();
-
-        assertThat(result).hasSize(20);
-        for (int i = 0; i < 20; i++) {
-            assertThat(result[i]).isEqualTo(i * 1.1);
-        }
-    }
-
-    @Test
     public void testToFloatArrayWithLargeArray() {
-        float[] input = new float[20];
-        for (int i = 0; i < 20; i++) {
+        float[] input = new float[1024];
+        for (int i = 0; i < 1024; i++) {
             input[i] = i * 1.5f;
         }
         BinaryArray binaryArray = BinaryArray.fromPrimitiveArray(input);
 
         float[] result = binaryArray.toFloatArray();
 
-        assertThat(result).hasSize(20);
-        for (int i = 0; i < 20; i++) {
+        assertThat(result).hasSize(1024);
+        for (int i = 0; i < 1024; i++) {
             assertThat(result[i]).isEqualTo(i * 1.5f);
         }
     }
 
     @Test
-    public void testToLongArrayWithLargeArray() {
-        long[] input = new long[20];
-        for (int i = 0; i < 20; i++) {
-            input[i] = i * 1000L;
-        }
-        BinaryArray binaryArray = BinaryArray.fromPrimitiveArray(input);
-
-        long[] result = binaryArray.toLongArray();
-
-        assertThat(result).hasSize(20);
-        for (int i = 0; i < 20; i++) {
-            assertThat(result[i]).isEqualTo(i * 1000L);
-        }
+    public void testRoundTripToBooleanArray() {
+        boolean[] array = {true, false, true, false, true};
+        BinaryArray binaryArray = BinaryArray.fromPrimitiveArray(array);
+        assertThat(binaryArray.toBooleanArray()).isEqualTo(array);
     }
 
     @Test
-    public void testToIntArrayWithLargeArray() {
-        int[] input = new int[20];
-        for (int i = 0; i < 20; i++) {
-            input[i] = i * 100;
-        }
-        BinaryArray binaryArray = BinaryArray.fromPrimitiveArray(input);
-
-        int[] result = binaryArray.toIntArray();
-
-        assertThat(result).hasSize(20);
-        for (int i = 0; i < 20; i++) {
-            assertThat(result[i]).isEqualTo(i * 100);
-        }
+    public void testRoundTripToByteArray() {
+        byte[] array = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+        BinaryArray binaryArray = BinaryArray.fromPrimitiveArray(array);
+        assertThat(binaryArray.toByteArray()).isEqualTo(array);
     }
 
     @Test
-    public void testToShortArrayWithLargeArray() {
-        short[] input = new short[20];
-        for (int i = 0; i < 20; i++) {
-            input[i] = (short) (i * 10);
-        }
-        BinaryArray binaryArray = BinaryArray.fromPrimitiveArray(input);
-
-        short[] result = binaryArray.toShortArray();
-
-        assertThat(result).hasSize(20);
-        for (int i = 0; i < 20; i++) {
-            assertThat(result[i]).isEqualTo((short) (i * 10));
-        }
+    public void testRoundTripToShortArray() {
+        short[] array = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
+        BinaryArray binaryArray = BinaryArray.fromPrimitiveArray(array);
+        assertThat(binaryArray.toShortArray()).isEqualTo(array);
     }
 
     @Test
-    public void testToByteArrayWithLargeArray() {
-        byte[] input = new byte[20];
-        for (int i = 0; i < 20; i++) {
-            input[i] = (byte) i;
-        }
-        BinaryArray binaryArray = BinaryArray.fromPrimitiveArray(input);
-
-        byte[] result = binaryArray.toByteArray();
-
-        assertThat(result).hasSize(20);
-        for (int i = 0; i < 20; i++) {
-            assertThat(result[i]).isEqualTo((byte) i);
-        }
+    public void testRoundTripToIntArray() {
+        int[] array = {100, 200, 300, 400, 500, 600, 700, 800, 900, 1000};
+        BinaryArray binaryArray = BinaryArray.fromPrimitiveArray(array);
+        assertThat(binaryArray.toIntArray()).isEqualTo(array);
     }
 
     @Test
-    public void testToBooleanArrayWithLargeArray() {
-        boolean[] input = new boolean[20];
-        for (int i = 0; i < 20; i++) {
-            input[i] = i % 2 == 0;
-        }
-        BinaryArray binaryArray = BinaryArray.fromPrimitiveArray(input);
+    public void testRoundTripToLongArray() {
+        long[] array = {1000L, 2000L, 3000L, 4000L, 5000L, 6000L, 7000L, 8000L, 9000L, 10000L};
+        BinaryArray binaryArray = BinaryArray.fromPrimitiveArray(array);
+        assertThat(binaryArray.toLongArray()).isEqualTo(array);
+    }
 
-        boolean[] result = binaryArray.toBooleanArray();
+    @Test
+    public void testRoundTripToFloatArray() {
+        float[] array = {1.1f, 2.2f, 3.3f, 4.4f, 5.5f, 6.6f, 7.7f, 8.8f, 9.9f, 10.10f};
+        BinaryArray binaryArray = BinaryArray.fromPrimitiveArray(array);
+        assertThat(binaryArray.toFloatArray()).isEqualTo(array);
+    }
 
-        assertThat(result).hasSize(20);
+    @Test
+    public void testRoundTripToDoubleArray() {
+        double[] array = new double[20];
         for (int i = 0; i < 20; i++) {
-            assertThat(result[i]).isEqualTo(i % 2 == 0);
+            array[i] = i * 1.1;
         }
+        BinaryArray binaryArray = BinaryArray.fromPrimitiveArray(array);
+        assertThat(binaryArray.toDoubleArray()).isEqualTo(array);
     }
 }
