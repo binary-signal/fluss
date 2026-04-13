@@ -121,6 +121,7 @@ import org.apache.fluss.server.zk.data.ZkData.PartitionIdsZNode;
 import org.apache.fluss.server.zk.data.ZkData.TableIdsZNode;
 import org.apache.fluss.server.zk.data.lake.LakeTableHelper;
 import org.apache.fluss.server.zk.data.lake.LakeTableSnapshot;
+import org.apache.fluss.utils.AutoPartitionStrategy;
 import org.apache.fluss.utils.types.Tuple2;
 
 import org.slf4j.Logger;
@@ -308,6 +309,7 @@ public class CoordinatorEventProcessor implements EventProcessor {
         coordinatorEventManager.close();
         rebalanceManager.close();
         onShutdown();
+        coordinatorContext.resetContext();
     }
 
     private ServerInfo getCoordinatorServerInfo() {
@@ -715,7 +717,13 @@ public class CoordinatorEventProcessor implements EventProcessor {
         }
 
         TableInfo oldTableInfo = coordinatorContext.getTableInfoById(tableId);
-        if (oldTableInfo.getSchemaId() == schemaInfo.getSchemaId()) {
+        if (oldTableInfo.getSchemaId() >= schemaInfo.getSchemaId()) {
+            LOG.info(
+                    "Skipping stale schema change event for table {} with schemaId {}"
+                            + " since the current schemaId is already {}.",
+                    tablePath,
+                    schemaInfo.getSchemaId(),
+                    oldTableInfo.getSchemaId());
             return;
         }
 
@@ -797,6 +805,15 @@ public class CoordinatorEventProcessor implements EventProcessor {
                         newTableInfo.getTableId(), newFreshness.toMillis());
             }
         }
+
+        AutoPartitionStrategy autoPartitionStrategy =
+                newTableInfo.getTableConfig().getAutoPartitionStrategy();
+        if (autoPartitionStrategy.isAutoPartitionEnabled()
+                && autoPartitionStrategy.numToRetain()
+                        != oldTableInfo.getTableConfig().getAutoPartitionStrategy().numToRetain()) {
+            autoPartitionManager.updateAutoPartitionTables(newTableInfo);
+        }
+
         // more post-alter actions can be added here
     }
 
@@ -1602,7 +1619,10 @@ public class CoordinatorEventProcessor implements EventProcessor {
             tableAssignment.forEach(
                     (bucket, replicas) ->
                             newTableAssignment.put(bucket, new BucketAssignment(replicas)));
-            zooKeeperClient.updateTableAssignment(tableId, new TableAssignment(newTableAssignment));
+            zooKeeperClient.updateTableAssignment(
+                    tableId,
+                    new TableAssignment(newTableAssignment),
+                    coordinatorContext.getCoordinatorZkVersion());
         } else {
             Map<Integer, List<Integer>> partitionAssignment =
                     coordinatorContext.getPartitionAssignment(
@@ -1613,7 +1633,9 @@ public class CoordinatorEventProcessor implements EventProcessor {
                     (bucket, replicas) ->
                             newPartitionAssignment.put(bucket, new BucketAssignment(replicas)));
             zooKeeperClient.updatePartitionAssignment(
-                    partitionId, new PartitionAssignment(tableId, newPartitionAssignment));
+                    partitionId,
+                    new PartitionAssignment(tableId, newPartitionAssignment),
+                    coordinatorContext.getCoordinatorZkVersion());
         }
     }
 
@@ -1659,7 +1681,8 @@ public class CoordinatorEventProcessor implements EventProcessor {
         }
 
         try {
-            zooKeeperClient.batchUpdateLeaderAndIsr(newLeaderAndIsrList);
+            zooKeeperClient.batchUpdateLeaderAndIsr(
+                    newLeaderAndIsrList, coordinatorContext.getCoordinatorZkVersion());
             newLeaderAndIsrList.forEach(
                     (tableBucket, newLeaderAndIsr) ->
                             result.add(new AdjustIsrResultForBucket(tableBucket, newLeaderAndIsr)));
@@ -1670,7 +1693,10 @@ public class CoordinatorEventProcessor implements EventProcessor {
                 TableBucket tableBucket = entry.getKey();
                 LeaderAndIsr newLeaderAndIsr = entry.getValue();
                 try {
-                    zooKeeperClient.updateLeaderAndIsr(tableBucket, newLeaderAndIsr);
+                    zooKeeperClient.updateLeaderAndIsr(
+                            tableBucket,
+                            newLeaderAndIsr,
+                            coordinatorContext.getCoordinatorZkVersion());
                 } catch (Exception e) {
                     LOG.error("Error when register leader and isr.", e);
                     result.add(
@@ -2196,7 +2222,8 @@ public class CoordinatorEventProcessor implements EventProcessor {
         LeaderAndIsr newLeaderAndIsr = leaderAndIsr.newLeaderAndIsr(leaderAndIsr.isr());
 
         coordinatorContext.putBucketLeaderAndIsr(tableBucket, newLeaderAndIsr);
-        zooKeeperClient.updateLeaderAndIsr(tableBucket, newLeaderAndIsr);
+        zooKeeperClient.updateLeaderAndIsr(
+                tableBucket, newLeaderAndIsr, coordinatorContext.getCoordinatorZkVersion());
 
         coordinatorRequestBatch.newBatch();
         coordinatorRequestBatch.addNotifyLeaderRequestForTabletServers(

@@ -336,6 +336,11 @@ public class ReplicaManager implements ServerReconfigurable {
         return minInSyncReplicas;
     }
 
+    @VisibleForTesting
+    public int getCoordinatorEpoch() {
+        return coordinatorEpoch;
+    }
+
     // ============ ServerReconfigurable Implementation ============
 
     @Override
@@ -1412,13 +1417,22 @@ public class ReplicaManager implements ServerReconfigurable {
                     fetchParams.markReadOneMessage();
                 }
                 limitBytes = Math.max(0, limitBytes - recordBatchSize);
-
+                FetchLogResultForBucket fetchLogResult;
+                if (fetchedData.hasFilteredEndOffset()) {
+                    fetchLogResult =
+                            new FetchLogResultForBucket(
+                                    tb,
+                                    fetchedData.getRecords(),
+                                    readInfo.getHighWatermark(),
+                                    fetchedData.getFilteredEndOffset());
+                } else {
+                    fetchLogResult =
+                            new FetchLogResultForBucket(
+                                    tb, fetchedData.getRecords(), readInfo.getHighWatermark());
+                }
                 logReadResult.put(
                         tb,
-                        new LogReadResult(
-                                new FetchLogResultForBucket(
-                                        tb, fetchedData.getRecords(), readInfo.getHighWatermark()),
-                                fetchedData.getFetchOffsetMetadata()));
+                        new LogReadResult(fetchLogResult, fetchedData.getFetchOffsetMetadata()));
 
                 // update metrics
                 if (isFromFollower) {
@@ -1870,9 +1884,14 @@ public class ReplicaManager implements ServerReconfigurable {
                             requestCoordinatorEpoch, requestName, this.coordinatorEpoch);
             LOG.warn("Ignore the {} request because {}", requestName, errorMessage);
             throw new InvalidCoordinatorException(errorMessage);
-        } else {
+        } else if (requestCoordinatorEpoch > this.coordinatorEpoch) {
+            LOG.info(
+                    "Update coordinator epoch from {} to {} for coordinator leader switch.",
+                    this.coordinatorEpoch,
+                    requestCoordinatorEpoch);
             this.coordinatorEpoch = requestCoordinatorEpoch;
         }
+        // ignore equal case
     }
 
     private void dropEmptyTableOrPartitionDir(Path dir, long id, String dirType) {
