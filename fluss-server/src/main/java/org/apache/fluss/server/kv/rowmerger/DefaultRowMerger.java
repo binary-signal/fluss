@@ -46,7 +46,7 @@ public class DefaultRowMerger implements RowMerger {
 
     @Nullable
     @Override
-    public BinaryValue merge(BinaryValue oldValue, BinaryValue newValue) {
+    public BinaryValue merge(@Nullable BinaryValue oldValue, BinaryValue newValue) {
         // always retain the new row (latest row)
         return newValue;
     }
@@ -98,13 +98,8 @@ public class DefaultRowMerger implements RowMerger {
 
         @Nullable
         @Override
-        public BinaryValue merge(BinaryValue oldValue, BinaryValue newValue) {
+        public BinaryValue merge(@Nullable BinaryValue oldValue, BinaryValue newValue) {
             return partialUpdater.updateRow(oldValue, newValue);
-        }
-
-        @Override
-        public BinaryValue mergeInsert(BinaryValue newValue) {
-            return partialUpdater.updateRow(null, newValue);
         }
 
         @Nullable

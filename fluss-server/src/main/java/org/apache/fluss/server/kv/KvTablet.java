@@ -562,10 +562,7 @@ public final class KvTablet {
 
         byte[] oldValueBytes = getFromBufferOrKv(key);
         if (oldValueBytes == null) {
-            // For partial updates on first insert, we need to merge to null out
-            // non-target columns. Without this, the full row (including non-target
-            // column values) would be stored as-is.
-            BinaryValue valueToInsert = currentMerger.mergeInsert(currentValue);
+            BinaryValue valueToInsert = currentMerger.merge(null, currentValue);
             return applyInsert(
                     key,
                     valueToInsert,
