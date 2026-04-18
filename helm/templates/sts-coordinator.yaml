@@ -32,8 +32,15 @@ spec:
   template:
     metadata:
       labels:
+        {{- with .Values.coordinator.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
         {{- include "fluss.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: coordinator
+      {{- with .Values.coordinator.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
       {{- if .Values.serviceAccount.create }}
       serviceAccountName: {{ .Values.serviceAccount.name | default (include "fluss.fullname" .) }}
@@ -68,6 +75,13 @@ spec:
             - name: FLUSS_ENV_JAVA_OPTS
               value: "-Djava.security.auth.login.config=/etc/fluss/conf/jaas.conf"
             {{- end }}
+            {{- with .Values.coordinator.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.coordinator.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - name: internal
               containerPort: {{ .Values.listeners.internal.port }}

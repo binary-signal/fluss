@@ -23,6 +23,7 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.FencedLeaderEpochException;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
+import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.InvalidTimestampException;
 import org.apache.fluss.exception.InvalidUpdateVersionException;
 import org.apache.fluss.exception.KvStorageException;
@@ -57,6 +58,7 @@ import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvRecoverHelper;
 import org.apache.fluss.server.kv.KvTablet;
+import org.apache.fluss.server.kv.RemoteLogFetcher;
 import org.apache.fluss.server.kv.autoinc.AutoIncIDRange;
 import org.apache.fluss.server.kv.rocksdb.RocksDBKvBuilder;
 import org.apache.fluss.server.kv.snapshot.CompletedKvSnapshotCommitter;
@@ -186,6 +188,7 @@ public final class Replica {
     private final AtomicReference<Integer> leaderReplicaIdOpt = new AtomicReference<>();
     private final ReadWriteLock leaderIsrUpdateLock = new ReentrantReadWriteLock();
     private final Clock clock;
+    private final RemoteLogManager remoteLogManager;
 
     private static final int INIT_KV_TABLET_MAX_RETRY_TIMES = 5;
     /**
@@ -231,7 +234,8 @@ public final class Replica {
             FatalErrorHandler fatalErrorHandler,
             BucketMetricGroup bucketMetricGroup,
             TableInfo tableInfo,
-            Clock clock)
+            Clock clock,
+            RemoteLogManager remoteLogManager)
             throws Exception {
         this.physicalPath = physicalPath;
         this.tableBucket = tableBucket;
@@ -263,6 +267,7 @@ public final class Replica {
         this.logTablet = createLog(lazyHighWatermarkCheckpoint);
         this.logTablet.updateIsDataLakeEnabled(tableConfig.isDataLakeEnabled());
         this.clock = clock;
+        this.remoteLogManager = remoteLogManager;
         registerMetrics();
     }
 
@@ -549,11 +554,20 @@ public final class Replica {
     private void registerLakeTieringMetrics() {
         lakeTieringMetricGroup = bucketMetricGroup.addGroup("lakeTiering");
         lakeTieringMetricGroup.gauge(
-                MetricNames.LOG_LAKE_PENDING_RECORDS,
-                () ->
-                        getLakeLogEndOffset() < 0L
-                                ? getLogHighWatermark() - getLogStartOffset()
-                                : getLogHighWatermark() - getLakeLogEndOffset());
+                MetricNames.LAKE_PENDING_RECORDS,
+                () -> {
+                    long lakeLogEndOffset = getLakeLogEndOffset();
+                    if (lakeLogEndOffset < 0L) {
+                        try {
+                            return getRowCount();
+                        } catch (InvalidTableException e) {
+                            // WAL mode or v0.9 old table with no completed tiering:
+                            // row count disabled, return -1 to indicate unavailable
+                            return -1L;
+                        }
+                    }
+                    return getLogHighWatermark() - lakeLogEndOffset;
+                });
         lakeTieringMetricGroup.gauge(
                 MetricNames.LOG_LAKE_TIMESTAMP_LAG,
                 () ->
@@ -836,18 +850,29 @@ public final class Replica {
                             getTablePath(),
                             snapshotContext.getZooKeeperClient(),
                             snapshotContext.maxFetchLogSizeInRecoverKv());
-            KvRecoverHelper kvRecoverHelper =
-                    new KvRecoverHelper(
-                            kvTablet,
-                            logTablet,
-                            startRecoverLogOffset,
-                            rowCount,
-                            autoIncIDRange,
-                            recoverContext,
-                            tableConfig.getKvFormat(),
-                            tableConfig.getLogFormat(),
-                            schemaGetter);
-            kvRecoverHelper.recover();
+
+            // Always create RemoteLogFetcher; the temp directory is lazily created only
+            // when fetch() is actually called, so this is lightweight.
+            RemoteLogFetcher remoteLogFetcher =
+                    new RemoteLogFetcher(remoteLogManager, tableBucket, logTablet.getLogDir());
+
+            try {
+                KvRecoverHelper kvRecoverHelper =
+                        new KvRecoverHelper(
+                                kvTablet,
+                                logTablet,
+                                startRecoverLogOffset,
+                                rowCount,
+                                autoIncIDRange,
+                                recoverContext,
+                                tableConfig.getKvFormat(),
+                                tableConfig.getLogFormat(),
+                                schemaGetter,
+                                remoteLogFetcher);
+                kvRecoverHelper.recover();
+            } finally {
+                remoteLogFetcher.close();
+            }
         } catch (Exception e) {
             throw new KvStorageException(
                     String.format(
