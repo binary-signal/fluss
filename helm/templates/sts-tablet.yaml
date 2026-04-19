@@ -32,8 +32,15 @@ spec:
   template:
     metadata:
       labels:
+        {{- with .Values.tablet.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
         {{- include "fluss.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: tablet
+      {{- with .Values.tablet.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
       {{- if .Values.serviceAccount.create }}
       serviceAccountName: {{ .Values.serviceAccount.name | default (include "fluss.fullname" .) }}
@@ -64,6 +71,13 @@ spec:
             - name: FLUSS_ENV_JAVA_OPTS
               value: "-Djava.security.auth.login.config=/etc/fluss/conf/jaas.conf"
             {{- end }}
+            {{- with .Values.tablet.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.tablet.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - name: internal
               containerPort: {{ .Values.listeners.internal.port }}
