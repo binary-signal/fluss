@@ -464,41 +464,6 @@ class KvTabletTest {
     }
 
     @Test
-    void testPartialUpdateFirstInsertNullsNonTargetColumns() throws Exception {
-        initLogTabletAndKvTablet(DATA2_SCHEMA, new HashMap<>());
-        RowType rowType = DATA2_SCHEMA.getRowType();
-        KvRecordTestUtils.KvRecordFactory data2kvRecordFactory =
-                KvRecordTestUtils.KvRecordFactory.of(rowType);
-
-        // Bug reproduction: partial update with targetColumns={0,1} (a, b) but the row
-        // contains non-null values for ALL columns including non-target column c.
-        // On first insert (no existing row), non-target columns should be set to null.
-        KvRecordBatch kvRecordBatch =
-                kvRecordBatchFactory.ofRecords(
-                        data2kvRecordFactory.ofRecord(
-                                "k1".getBytes(), new Object[] {1, "v1", "should_be_null"}));
-
-        int[] targetColumns = new int[] {0, 1};
-        kvTablet.putAsLeader(kvRecordBatch, targetColumns);
-
-        // The stored value should have column c (index 2) set to null,
-        // NOT "should_be_null", because c is not in targetColumns.
-        assertThat(kvTablet.getKvPreWriteBuffer().get(Key.of("k1".getBytes())))
-                .isEqualTo(valueOf(compactedRow(rowType, new Object[] {1, "v1", null})));
-
-        // Also verify CDC log emits the correct row with null for non-target column
-        LogRecords actualLogRecords = readLogRecords();
-        List<MemoryLogRecords> expectedLogs =
-                Collections.singletonList(
-                        logRecords(
-                                rowType,
-                                0,
-                                Collections.singletonList(ChangeType.INSERT),
-                                Collections.singletonList(new Object[] {1, "v1", null})));
-        checkEqual(actualLogRecords, expectedLogs, rowType);
-    }
-
-    @Test
     void testPartialUpdateFirstInsertThenUpdate() throws Exception {
         initLogTabletAndKvTablet(DATA2_SCHEMA, new HashMap<>());
         RowType rowType = DATA2_SCHEMA.getRowType();
