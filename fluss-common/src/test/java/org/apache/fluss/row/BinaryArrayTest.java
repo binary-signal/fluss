@@ -1029,4 +1029,11 @@ public class BinaryArrayTest {
         BinaryArray binaryArray = BinaryArray.fromPrimitiveArray(array);
         assertThat(binaryArray.toDoubleArray()).isEqualTo(array);
     }
+
+    @Test
+    public void testRoundTripEmptyDoubleArray() {
+        double[] array = new double[0];
+        BinaryArray binaryArray = BinaryArray.fromPrimitiveArray(array);
+        assertThat(binaryArray.toDoubleArray()).isEqualTo(array);
+    }
 }
