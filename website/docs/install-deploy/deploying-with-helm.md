@@ -192,6 +192,7 @@ The following table lists the configurable parameters of the Fluss chart, and th
 | `security.client.sasl.plain.users` | Client listener username and password pairs for PLAIN | `[]` |
 | `security.internal.sasl.plain.username` | Internal listener PLAIN username | `""` |
 | `security.internal.sasl.plain.password` | Internal listener PLAIN password | `""` |
+| `security.internal.sasl.plain.existingSecret` | Reference to a pre-existing Secret for internal SASL credentials | `{}` |
 
 Only `plain` mechanism is supported for now. An empty string disables the SASL authentication, and maps to the `PLAINTEXT` protocol.
 
@@ -210,6 +211,154 @@ It is recommended to set these explicitly in production.
 | `security.zookeeper.sasl.plain.username` | ZooKeeper SASL username | `""` |
 | `security.zookeeper.sasl.plain.password` | ZooKeeper SASL password | `""` |
 | `security.zookeeper.sasl.plain.loginModuleClass` | JAAS login module class for ZooKeeper | `org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.server.auth.DigestLoginModule` |
+| `security.zookeeper.sasl.plain.existingSecret` | Reference to a pre-existing Secret for ZooKeeper SASL credentials | `{}` |
+
+#### Sourcing SASL Credentials from a Pre-existing Secret
+
+To keep SASL passwords out of `values.yaml` and the Helm release storage, reference a Secret managed separately — e.g., via External Secrets Operator, Sealed Secrets, or a CI pipeline.
+
+For internal and ZooKeeper listeners, set `existingSecret` on the listener:
+
+```yaml
+security:
+  internal:
+    sasl:
+      mechanism: plain
+      plain:
+        existingSecret:
+          name: fluss-internal-sasl   # required
+          usernameKey: username       # optional, defaults to "username"
+          passwordKey: password       # optional, defaults to "password"
+  zookeeper:
+    sasl:
+      mechanism: plain
+      plain:
+        existingSecret:
+          name: fluss-zk-sasl
+```
+
+Client users follow the same shape as internal/ZooKeeper listeners: each entry is either a literal `{username, password}` pair or an `existingSecret` reference that sources both fields from a Secret.
+
+```yaml
+security:
+  client:
+    sasl:
+      mechanism: plain
+      plain:
+        users:
+          - username: alice
+            password: alice-literal-password   # literal — visible in values.yaml
+          - existingSecret:                    # or resolved at pod startup
+              name: fluss-client-sasl-bob
+              usernameKey: username            # optional, defaults to "username"
+              passwordKey: password            # optional, defaults to "password"
+```
+
+Whenever JAAS is required, the chart renders a ConfigMap (`<release>-fluss-sasl-jaas-config`) containing a `jaas.conf` *template* with `${FLUSS_JAAS_…}` placeholders — no credentials. An init container mounts that template, runs `envsubst` with credentials supplied via env vars (either literal `value:` entries from `values.yaml` or `valueFrom.secretKeyRef` to a pre-existing Secret), and writes the resolved `jaas.conf` to an in-memory `emptyDir` that the main Fluss container reads.
+
+- Literal and Secret-sourced credentials can be mixed across listeners.
+- When every credential comes from a Secret, no plaintext password lives in the Helm release.
+- The init container reuses the main Fluss image (already present on the node), keeping zero extra image dependencies.
+
+##### Example: External Secrets Operator
+
+If you use [External Secrets Operator](https://external-secrets.io) to sync credentials from an upstream secret manager (AWS Secrets Manager, Vault, GCP Secret Manager, etc.), the flow is: upstream → `ExternalSecret` CR → a Kubernetes `Secret` → the chart.
+
+For internal listener credentials stored at `prod/fluss/internal` in AWS Secrets Manager with fields `username` and `password`:
+
+```yaml
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: fluss-internal-sasl
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secretsmanager
+    kind: SecretStore
+  target:
+    name: fluss-internal-sasl
+  data:
+    - secretKey: username
+      remoteRef:
+        key: prod/fluss/internal
+        property: username
+    - secretKey: password
+      remoteRef:
+        key: prod/fluss/internal
+        property: password
+```
+
+Then in `values.yaml`:
+
+```yaml
+security:
+  internal:
+    sasl:
+      mechanism: plain
+      plain:
+        existingSecret:
+          name: fluss-internal-sasl
+```
+
+For the multi-user client listener, provision one Secret per user with `username` and `password` keys:
+
+```yaml
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: fluss-client-sasl-alice
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secretsmanager
+    kind: SecretStore
+  target:
+    name: fluss-client-sasl-alice
+  data:
+    - secretKey: username
+      remoteRef:
+        key: prod/fluss/clients/alice
+        property: username
+    - secretKey: password
+      remoteRef:
+        key: prod/fluss/clients/alice
+        property: password
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: fluss-client-sasl-bob
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: aws-secretsmanager
+    kind: SecretStore
+  target:
+    name: fluss-client-sasl-bob
+  data:
+    - secretKey: username
+      remoteRef:
+        key: prod/fluss/clients/bob
+        property: username
+    - secretKey: password
+      remoteRef:
+        key: prod/fluss/clients/bob
+        property: password
+```
+
+```yaml
+security:
+  client:
+    sasl:
+      mechanism: plain
+      plain:
+        users:
+          - existingSecret: { name: fluss-client-sasl-alice }
+          - existingSecret: { name: fluss-client-sasl-bob }
+```
+
+The same pattern works with Sealed Secrets, HashiCorp Vault Agent Injector (producing a native Secret), or any other controller that lands credentials in a `Secret` — the chart only cares about the final `Secret`, not how it got there.
 
 ### Metrics Parameters
 
@@ -239,6 +388,19 @@ It is recommended to set these explicitly in production.
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `tablet.numberOfReplicas` | Number of TabletServer replicas to deploy | `3` |
+
+### Scheduling Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `tablet.affinity` | Affinity rules for TabletServer pods | `{}` |
+| `tablet.nodeSelector` | Node selector for TabletServer pods | `{}` |
+| `tablet.tolerations` | Tolerations for TabletServer pods | `[]` |
+| `tablet.topologySpreadConstraints` | Topology spread constraints for TabletServer pods | `[]` |
+| `coordinator.affinity` | Affinity rules for CoordinatorServer pods | `{}` |
+| `coordinator.nodeSelector` | Node selector for CoordinatorServer pods | `{}` |
+| `coordinator.tolerations` | Tolerations for CoordinatorServer pods | `[]` |
+| `coordinator.topologySpreadConstraints` | Topology spread constraints for CoordinatorServer pods | `[]` |
 
 ### Storage Parameters
 
@@ -486,6 +648,73 @@ configurationOverrides:
   data.dir: "/data/fluss"
   remote.data.dir: "s3://my-bucket/fluss-data"
 ```
+
+### Pod Scheduling
+
+By default, Kubernetes may schedule all tablet server pods on the same node. Even with replication factor 3, a single node failure could take out all replicas simultaneously, causing data loss for segments not yet tiered to remote storage.
+
+Use pod anti-affinity to spread tablet server pods across availability zones and nodes:
+
+```yaml
+tablet:
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: topology.kubernetes.io/zone
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/instance: <release-name>
+                app.kubernetes.io/component: tablet
+        - weight: 50
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/instance: <release-name>
+                app.kubernetes.io/component: tablet
+```
+
+Replace `<release-name>` with your Helm release name (the value passed to `helm install`) so the selector scopes to pods of this release only. This matters when multiple Fluss releases share the cluster — otherwise anti-affinity would count pods across releases.
+
+This configuration prioritizes zone-level spreading (weight 100) while also avoiding co-location on the same node (weight 50). For stricter guarantees, use `requiredDuringSchedulingIgnoredDuringExecution` instead — but note that pods will stay pending if no suitable node is available.
+
+Alternatively, use `topologySpreadConstraints` for even distribution across failure domains:
+
+```yaml
+tablet:
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/instance: <release-name>
+          app.kubernetes.io/component: tablet
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/instance: <release-name>
+          app.kubernetes.io/component: tablet
+```
+
+You can also pin pods to specific nodes using `nodeSelector` or allow scheduling on tainted nodes with `tolerations`:
+
+```yaml
+tablet:
+  nodeSelector:
+    workload: fluss
+  tolerations:
+    - key: dedicated
+      operator: Equal
+      value: fluss
+      effect: NoSchedule
+```
+
+The same scheduling fields are available for coordinator servers under `coordinator.affinity`, `coordinator.nodeSelector`, `coordinator.tolerations`, and `coordinator.topologySpreadConstraints`.
 
 ### Loading Filesystem Plugins via Init Containers
 
