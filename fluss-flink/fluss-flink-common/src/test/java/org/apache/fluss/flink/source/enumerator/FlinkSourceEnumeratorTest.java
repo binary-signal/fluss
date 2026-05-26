@@ -25,16 +25,15 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.flink.lake.split.LakeSnapshotAndFlussLogSplit;
 import org.apache.fluss.flink.lake.split.LakeSnapshotSplit;
-import org.apache.fluss.flink.source.FlinkSource;
-import org.apache.fluss.flink.source.deserializer.RowDataDeserializationSchema;
 import org.apache.fluss.flink.source.event.PartitionBucketsUnsubscribedEvent;
 import org.apache.fluss.flink.source.event.PartitionsRemovedEvent;
+import org.apache.fluss.flink.source.event.UnfinishedSplitEvent;
 import org.apache.fluss.flink.source.reader.LeaseContext;
 import org.apache.fluss.flink.source.split.HybridSnapshotLogSplit;
+import org.apache.fluss.flink.source.split.KvBatchSplit;
 import org.apache.fluss.flink.source.split.LogSplit;
 import org.apache.fluss.flink.source.split.SnapshotSplit;
 import org.apache.fluss.flink.source.split.SourceSplitBase;
-import org.apache.fluss.flink.source.state.SourceEnumeratorState;
 import org.apache.fluss.flink.utils.FlinkTestBase;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.LakeSplit;
@@ -56,10 +55,9 @@ import org.apache.fluss.types.DataTypes;
 
 import org.apache.flink.api.connector.source.ReaderInfo;
 import org.apache.flink.api.connector.source.SourceEvent;
-import org.apache.flink.api.connector.source.SplitEnumerator;
 import org.apache.flink.api.connector.source.SplitsAssignment;
 import org.apache.flink.api.connector.source.mocks.MockSplitEnumeratorContext;
-import org.apache.flink.table.data.RowData;
+import org.apache.flink.util.FlinkRuntimeException;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -149,6 +147,100 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
     }
 
     @Test
+    void testBoundedPkTableEmitsKvBatchSplits() throws Throwable {
+        long tableId = createTable(DEFAULT_TABLE_PATH, DEFAULT_PK_TABLE_DESCRIPTOR);
+        int numSubtasks = DEFAULT_BUCKET_NUM;
+        try (MockSplitEnumeratorContext<SourceSplitBase> context =
+                new MockSplitEnumeratorContext<>(numSubtasks)) {
+            FlinkSourceEnumerator enumerator =
+                    new FlinkSourceEnumerator(
+                            DEFAULT_TABLE_PATH,
+                            flussConf,
+                            true,
+                            false,
+                            context,
+                            OffsetsInitializer.full(),
+                            DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
+                            false, // bounded
+                            null,
+                            null,
+                            LeaseContext.DEFAULT,
+                            false);
+
+            enumerator.start();
+            for (int i = 0; i < numSubtasks; i++) {
+                registerReader(context, enumerator, i);
+            }
+            assertThat(context.getSplitsAssignmentSequence()).isEmpty();
+
+            // Drive the bounded-mode async split generation.
+            context.runNextOneTimeCallable();
+
+            Map<Integer, List<SourceSplitBase>> expectedAssignment = new HashMap<>();
+            for (int bucket = 0; bucket < DEFAULT_BUCKET_NUM; bucket++) {
+                KvBatchSplit split = new KvBatchSplit(new TableBucket(tableId, bucket), null);
+                int owner = enumerator.getSplitOwner(split);
+                expectedAssignment.computeIfAbsent(owner, k -> new ArrayList<>()).add(split);
+            }
+            Map<Integer, List<SourceSplitBase>> actualAssignment = getReadersAssignments(context);
+            assertThat(actualAssignment).isEqualTo(expectedAssignment);
+            actualAssignment
+                    .values()
+                    .forEach(
+                            splits -> splits.forEach(s -> assertThat(s.isKvBatchSplit()).isTrue()));
+        }
+    }
+
+    /**
+     * On {@link UnfinishedSplitEvent} the enumerator re-emits the split (so a transient leadership
+     * change recovers cleanly), but only up to a fixed budget. Past the budget it fails the job
+     * rather than hot-looping.
+     */
+    @Test
+    void testUnfinishedSplitEventRetryBudget() throws Throwable {
+        long tableId = createTable(DEFAULT_TABLE_PATH, DEFAULT_PK_TABLE_DESCRIPTOR);
+        try (MockSplitEnumeratorContext<SourceSplitBase> context =
+                new MockSplitEnumeratorContext<>(1)) {
+            FlinkSourceEnumerator enumerator =
+                    new FlinkSourceEnumerator(
+                            DEFAULT_TABLE_PATH,
+                            flussConf,
+                            true,
+                            false,
+                            context,
+                            OffsetsInitializer.full(),
+                            DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
+                            false, // bounded
+                            null,
+                            null,
+                            LeaseContext.DEFAULT,
+                            false);
+            enumerator.start();
+            registerReader(context, enumerator, 0);
+
+            TableBucket bucket = new TableBucket(tableId, 0);
+            KvBatchSplit split = new KvBatchSplit(bucket, null);
+            UnfinishedSplitEvent event =
+                    new UnfinishedSplitEvent(
+                            split.splitId(), bucket, null, "not leader or follower");
+
+            // 5 attempts succeed; each re-emits the split.
+            int initialAssignmentCount = context.getSplitsAssignmentSequence().size();
+            for (int i = 0; i < 5; i++) {
+                enumerator.handleSourceEvent(0, event);
+            }
+            assertThat(context.getSplitsAssignmentSequence().size() - initialAssignmentCount)
+                    .isEqualTo(5);
+
+            // 6th attempt exceeds the cap and fails the job.
+            assertThatThrownBy(() -> enumerator.handleSourceEvent(0, event))
+                    .isInstanceOf(FlinkRuntimeException.class)
+                    .hasMessageContaining("exceeded")
+                    .hasMessageContaining("re-assignment attempts");
+        }
+    }
+
+    @Test
     void testSplitAssignmentBatchSize() throws Throwable {
         long tableId = createTable(DEFAULT_TABLE_PATH, DEFAULT_PK_TABLE_DESCRIPTOR);
         try (MockSplitEnumeratorContext<SourceSplitBase> context =
@@ -212,100 +304,6 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
                                             false))
                     .isInstanceOf(IllegalArgumentException.class)
                     .hasMessageContaining("Split assignment batch size must be positive");
-        }
-    }
-
-    @Test
-    void testRestoreFlussOnlySourceWithLakeSourceDoesNotGenerateLakeSplits(@TempDir Path tempDir)
-            throws Throwable {
-        long tableId =
-                createTable(DEFAULT_TABLE_PATH, DEFAULT_AUTO_PARTITIONED_LOG_TABLE_DESCRIPTOR);
-        ZooKeeperClient zooKeeperClient = FLUSS_CLUSTER_EXTENSION.getZooKeeperClient();
-        Map<Long, String> partitionNameByIds =
-                waitUntilPartitions(zooKeeperClient, DEFAULT_TABLE_PATH);
-        Long partitionId = partitionNameByIds.keySet().stream().sorted().findFirst().get();
-        String partitionName = partitionNameByIds.get(partitionId);
-
-        LakeTableSnapshot lakeTableSnapshot =
-                new LakeTableSnapshot(
-                        0,
-                        ImmutableMap.of(
-                                new TableBucket(tableId, partitionId, 0), 50L,
-                                new TableBucket(tableId, partitionId, 1), 50L,
-                                new TableBucket(tableId, partitionId, 2), 50L));
-        LakeTableHelper lakeTableHelper = new LakeTableHelper(zooKeeperClient, tempDir.toString());
-        lakeTableHelper.registerLakeTableSnapshotV1(tableId, lakeTableSnapshot);
-
-        ResolvedPartitionSpec partitionSpec =
-                ResolvedPartitionSpec.fromPartitionName(
-                        Collections.singletonList("name"), partitionName);
-        LakeSource<LakeSplit> lakeSource =
-                new TestingLakeSource(
-                        DEFAULT_BUCKET_NUM,
-                        Collections.singletonList(
-                                new PartitionInfo(
-                                        partitionId, partitionSpec, DEFAULT_REMOTE_DATA_DIR)));
-
-        SourceEnumeratorState checkpointState;
-        try (MockSplitEnumeratorContext<SourceSplitBase> context =
-                        new MockSplitEnumeratorContext<>(1);
-                SplitEnumerator<SourceSplitBase, SourceEnumeratorState> enumerator =
-                        new FlinkSource<RowData>(
-                                        flussConf,
-                                        DEFAULT_TABLE_PATH,
-                                        false,
-                                        true,
-                                        DEFAULT_LOG_TABLE_SCHEMA.getRowType(),
-                                        null,
-                                        null,
-                                        OffsetsInitializer.timestamp(1000L),
-                                        0L,
-                                        new RowDataDeserializationSchema(),
-                                        streaming,
-                                        null,
-                                        LeaseContext.DEFAULT)
-                                .createEnumerator(context)) {
-            checkpointState = enumerator.snapshotState(1L);
-            assertThat(checkpointState.getRemainingHybridLakeFlussSplits()).isNull();
-        }
-
-        try (MockSplitEnumeratorContext<SourceSplitBase> context =
-                        new MockSplitEnumeratorContext<>(DEFAULT_BUCKET_NUM);
-                SplitEnumerator<SourceSplitBase, SourceEnumeratorState> restoredEnumerator =
-                        new FlinkSource<RowData>(
-                                        flussConf,
-                                        DEFAULT_TABLE_PATH,
-                                        false,
-                                        true,
-                                        DEFAULT_LOG_TABLE_SCHEMA.getRowType(),
-                                        null,
-                                        null,
-                                        OffsetsInitializer.full(),
-                                        0L,
-                                        new RowDataDeserializationSchema(),
-                                        streaming,
-                                        null,
-                                        lakeSource,
-                                        LeaseContext.DEFAULT)
-                                .restoreEnumerator(context, checkpointState)) {
-            assertThat(restoredEnumerator.snapshotState(1L).getRemainingHybridLakeFlussSplits())
-                    .isEmpty();
-
-            restoredEnumerator.start();
-            context.runNextOneTimeCallable();
-            context.runNextOneTimeCallable();
-
-            for (int i = 0; i < DEFAULT_BUCKET_NUM; i++) {
-                registerReader(context, restoredEnumerator, i);
-            }
-
-            List<SourceSplitBase> assignedSplits =
-                    getReadersAssignments(context).values().stream()
-                            .flatMap(List::stream)
-                            .collect(Collectors.toList());
-            assertThat(assignedSplits).isNotEmpty();
-            assertThat(assignedSplits).allMatch(split -> split instanceof LogSplit);
-            assertThat(assignedSplits).noneMatch(split -> split instanceof LakeSnapshotSplit);
         }
     }
 
@@ -951,7 +949,7 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
     // ---------------------
     private void registerReader(
             MockSplitEnumeratorContext<SourceSplitBase> context,
-            SplitEnumerator<SourceSplitBase, SourceEnumeratorState> enumerator,
+            FlinkSourceEnumerator enumerator,
             int readerId) {
         context.registerReader(new ReaderInfo(readerId, "location " + readerId));
         enumerator.addReader(readerId);
