@@ -393,9 +393,9 @@
                                      and not used / exposed downstream, mirroring the pattern
                                      of fluss-fs-hadoop-shaded -->
                                 <relocation>
-                                    <pattern>com.google.re2j</pattern>
+                                    <pattern>com.google</pattern>
                                     <shadedPattern>
-                                        org.apache.fluss.fs.shaded.s3.com.google.re2j
+                                        org.apache.fluss.fs.shaded.s3.com.google
                                     </shadedPattern>
                                 </relocation>
                                 <relocation>
