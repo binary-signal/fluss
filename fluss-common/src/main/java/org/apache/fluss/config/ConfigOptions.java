@@ -20,7 +20,6 @@ package org.apache.fluss.config;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.compression.ArrowCompressionType;
-import org.apache.fluss.compression.LogCompressionType;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DeleteBehavior;
@@ -241,6 +240,50 @@ public class ConfigOptions {
                                     "The periodic interval at which the coordinator's "
                                             + "TableLifecycleThrottler scans in-flight drops for "
                                             + "timeouts.");
+
+    public static final ConfigOption<Duration> COORDINATOR_REBALANCE_TARGET_UNAVAILABLE_TIMEOUT =
+            key("coordinator.rebalance.target-unavailable-timeout")
+                    .durationType()
+                    .defaultValue(Duration.ofMinutes(30))
+                    .withDescription(
+                            "The time after which a timed-out bucket migration is marked FAILED "
+                                    + "if its target tablet servers remain unavailable and no "
+                                    + "bucket-state progress is observed. Observed progress or all "
+                                    + "target servers becoming live resets this timer. Must be at "
+                                    + "least 1 ms and fit in a signed 64-bit millisecond value.");
+
+    public static final ConfigOption<Duration> COORDINATOR_REBALANCE_NO_PROGRESS_TIMEOUT =
+            key("coordinator.rebalance.no-progress-timeout")
+                    .durationType()
+                    .defaultValue(Duration.ofHours(24))
+                    .withDescription(
+                            "The time after which a timed-out bucket migration is marked FAILED "
+                                    + "if no bucket-state progress is observed, even when its target "
+                                    + "tablet servers are live. Observed progress resets this timer; "
+                                    + "this does not limit the total migration duration. Must be at "
+                                    + "least 1 ms and fit in a signed 64-bit millisecond value.");
+
+    public static final ConfigOption<Integer> COORDINATOR_REBALANCE_MAX_TRACKED_TIMED_OUT_TASKS =
+            key("coordinator.rebalance.max-tracked-timed-out-tasks")
+                    .intType()
+                    .defaultValue(8)
+                    .withDescription(
+                            "The maximum number of non-final timed-out bucket migrations tracked "
+                                    + "before the coordinator stops admitting new bucket migrations. "
+                                    + "Admission resumes when a tracked migration reaches a final "
+                                    + "status. This limits concurrent migrations and reconciliation "
+                                    + "work on the coordinator and ZooKeeper. Must be at least 1.");
+
+    public static final ConfigOption<Integer> COORDINATOR_REBALANCE_MAX_INFLIGHT_TASKS =
+            key("coordinator.rebalance.max-inflight-tasks")
+                    .intType()
+                    .defaultValue(1)
+                    .withDescription(
+                            "The maximum number of bucket-level rebalance tasks that can be "
+                                    + "executed concurrently by the coordinator. A higher value "
+                                    + "can speed up rebalance, while a lower value reduces the "
+                                    + "number of simultaneous bucket movements. Must be at least "
+                                    + "1.");
 
     public static final ConfigOption<Duration> COORDINATOR_OFFLINE_LEADER_RETRY_DELAY =
             key("coordinator.offline-leader.retry-delay")
@@ -810,10 +853,10 @@ public class ConfigOptions {
     public static final ConfigOption<Duration> WRITER_ID_EXPIRATION_TIME =
             key("server.writer-id.expiration-time")
                     .durationType()
-                    .defaultValue(Duration.ofDays(7))
+                    .defaultValue(Duration.ofDays(1))
                     .withDescription(
                             "The time that the tablet server will wait without receiving any write request from "
-                                    + "a client before expiring the related status. The default value is 7 days.");
+                                    + "a client before expiring the related status. The default value is 1 day.");
 
     public static final ConfigOption<Duration> WRITER_ID_EXPIRATION_CHECK_INTERVAL =
             key("server.writer-id.expiration-check-interval")
@@ -2003,26 +2046,6 @@ public class ConfigOptions {
                             "The compression level of ZSTD for the log records if the log format is set to `ARROW` "
                                     + "and the compression type is set to `ZSTD`. The valid range is 1 to 22.");
 
-    public static final ConfigOption<LogCompressionType> TABLE_LOG_COMPACTED_COMPRESSION_TYPE =
-            key("table.log.compacted.compression.type")
-                    .enumType(LogCompressionType.class)
-                    .defaultValue(LogCompressionType.NONE)
-                    .withDescription(
-                            "The compression type of the log record batches if the log format is set to `COMPACTED`. "
-                                    + "The candidate compression type is "
-                                    + Arrays.toString(LogCompressionType.values())
-                                    + ". Compressed batches use log batch format V3, which Fluss versions before 1.1 "
-                                    + "can't read: older clients and tablet servers fail with an 'Unsupported magic value' error. "
-                                    + "Upgrade all tablet servers and consumers (e.g., Flink jobs) before enabling compression.");
-
-    public static final ConfigOption<Integer> TABLE_LOG_COMPACTED_COMPRESSION_ZSTD_LEVEL =
-            key("table.log.compacted.compression.zstd.level")
-                    .intType()
-                    .defaultValue(3)
-                    .withDescription(
-                            "The compression level of ZSTD for the log record batches if the log format is set to `COMPACTED` "
-                                    + "and the compression type is set to `ZSTD`. The valid range is 1 to 22.");
-
     public static final ConfigOption<KvFormat> TABLE_KV_FORMAT =
             key("table.kv.format")
                     .enumType(KvFormat.class)
@@ -2557,6 +2580,16 @@ public class ConfigOptions {
                                     + "This applies to primary key tables, does not affect WAL or MANIFEST I/O, "
                                     + "and requires a TabletServer restart to take effect. "
                                     + "The default value is `false`.");
+
+    public static final ConfigOption<MemorySize> KV_COMPACTION_READAHEAD_SIZE =
+            key("kv.rocksdb.compaction.readahead-size")
+                    .memoryType()
+                    .defaultValue(MemorySize.ofMebiBytes(2))
+                    .withDescription(
+                            "The amount of data to prefetch when reading RocksDB SST files during compaction. "
+                                    + "A value of `0` disables compaction readahead. "
+                                    + "This applies to primary key tables and requires a TabletServer restart to take effect. "
+                                    + "The default value is `2MB`.");
 
     public static final ConfigOption<MemorySize> KV_LOG_MAX_FILE_SIZE =
             key("kv.rocksdb.log.max-file-size")

@@ -19,6 +19,7 @@ use crate::cluster::{Cluster, ServerNode, ServerType};
 use crate::error::{Error, FlussError, Result};
 use crate::metadata::{PhysicalTablePath, TableBucket, TablePath};
 use crate::proto::MetadataResponse;
+use crate::rpc::from_pb_table_path;
 use crate::rpc::message::{GetTableRequest, UpdateMetadataRequest};
 use crate::rpc::{RpcClient, ServerConnection};
 use crate::{PartitionId, TableId};
@@ -34,6 +35,8 @@ use tokio::sync::watch;
 
 const MAX_BOOTSTRAP_RETRIES: usize = 3;
 const BOOTSTRAP_RETRY_INTERVAL_MS: u64 = 100;
+/// How long a metadata request may go unanswered, matching the Java client.
+const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Metadata {
     cluster: ArcSwap<Cluster>,
@@ -44,6 +47,7 @@ pub struct Metadata {
     connections: Arc<RpcClient>,
     bootstrap: Arc<str>,
     cluster_version_tx: watch::Sender<u64>,
+    request_timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -54,7 +58,8 @@ struct BootstrapServer {
 
 impl Metadata {
     pub async fn new(bootstrap: &str, connections: Arc<RpcClient>) -> Result<Self> {
-        let cluster = Self::init_cluster(bootstrap, connections.clone()).await?;
+        let cluster =
+            Self::init_cluster(bootstrap, connections.clone(), METADATA_REQUEST_TIMEOUT).await?;
         let (cluster_version_tx, _) = watch::channel(0);
         Ok(Metadata {
             cluster: ArcSwap::from_pointee(cluster),
@@ -63,6 +68,7 @@ impl Metadata {
             connections,
             bootstrap: bootstrap.into(),
             cluster_version_tx,
+            request_timeout: METADATA_REQUEST_TIMEOUT,
         })
     }
 
@@ -154,7 +160,11 @@ impl Metadata {
         }
     }
 
-    async fn init_cluster(bootstrap_servers: &str, connections: Arc<RpcClient>) -> Result<Cluster> {
+    async fn init_cluster(
+        bootstrap_servers: &str,
+        connections: Arc<RpcClient>,
+        request_timeout: Duration,
+    ) -> Result<Cluster> {
         let bootstraps = Self::parse_bootstrap_servers(bootstrap_servers)?;
         let bootstrap_count = bootstraps.len();
         let mut errors = Vec::new();
@@ -184,12 +194,23 @@ impl Metadata {
             let cluster_result = if bootstrap_count == 1 {
                 Self::retry_bootstrap(
                     &bootstrap.raw,
-                    || Self::fetch_cluster_from_bootstrap(&server_node, connections.clone()),
+                    || {
+                        Self::fetch_cluster_from_bootstrap(
+                            &server_node,
+                            connections.clone(),
+                            request_timeout,
+                        )
+                    },
                     || connections.disconnect_endpoint(&server_node),
                 )
                 .await
             } else {
-                Self::fetch_cluster_from_bootstrap(&server_node, connections.clone()).await
+                Self::fetch_cluster_from_bootstrap(
+                    &server_node,
+                    connections.clone(),
+                    request_timeout,
+                )
+                .await
             };
 
             match cluster_result {
@@ -237,21 +258,48 @@ impl Metadata {
     async fn fetch_cluster_from_bootstrap(
         server_node: &ServerNode,
         connections: Arc<RpcClient>,
+        request_timeout: Duration,
     ) -> Result<Cluster> {
-        let con = connections.get_connection(server_node).await?;
-
-        let response = con
-            .request(UpdateMetadataRequest::new(
-                &HashSet::default(),
-                &HashSet::new(),
-                vec![],
-            ))
-            .await?;
+        let response = Self::request_metadata(
+            &connections,
+            server_node,
+            UpdateMetadataRequest::new(&HashSet::default(), &HashSet::new(), vec![]),
+            request_timeout,
+        )
+        .await?;
         Cluster::from_metadata_response(response, None)
     }
 
+    /// Fails as retriable if `server` does not answer within `timeout`, so the caller can ask
+    /// another server instead of waiting until the idle connection is closed.
+    async fn request_metadata(
+        connections: &RpcClient,
+        server: &ServerNode,
+        request: UpdateMetadataRequest,
+        timeout: Duration,
+    ) -> Result<MetadataResponse> {
+        let requesting = async {
+            let connection = connections.get_connection(server).await?;
+            connection.request(request).await
+        };
+        tokio::time::timeout(timeout, requesting)
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::FlussAPIError {
+                    api_error: FlussError::RequestTimeOut.to_api_error(Some(format!(
+                        "No metadata response from server {server:?} within {timeout:?}"
+                    ))),
+                })
+            })
+    }
+
     pub(crate) async fn reinit_cluster(&self) -> Result<()> {
-        let cluster = Self::init_cluster(&self.bootstrap, self.connections.clone()).await?;
+        let cluster = Self::init_cluster(
+            &self.bootstrap,
+            self.connections.clone(),
+            self.request_timeout,
+        )
+        .await?;
         let changing = self.changing.lock();
         self.replace_cluster(&changing, cluster);
         Ok(())
@@ -298,8 +346,20 @@ impl Metadata {
         physical_tables_to_invalid: &HashSet<PhysicalTablePath>,
     ) {
         self.invalidate(|cluster| {
-            Some(cluster.invalidate_physical_table_meta(physical_tables_to_invalid))
+            // Called for every failed bucket, so mostly the leaders are already dropped.
+            let locations = cluster.get_bucket_locations_by_path();
+            physical_tables_to_invalid
+                .iter()
+                .any(|path| locations.contains_key(path))
+                .then(|| cluster.invalidate_physical_table_meta(physical_tables_to_invalid))
         });
+    }
+
+    /// Drops the cached leaders of those of `table_buckets` that `server_id` still leads, so that a
+    /// leader already replaced by a metadata refresh is kept. Leaves the cache as it is, without
+    /// notifying a change, if `server_id` leads none of them.
+    pub fn invalidate_bucket_leaders(&self, table_buckets: &HashSet<TableBucket>, server_id: i32) {
+        self.invalidate(|cluster| cluster.invalidate_bucket_leaders(table_buckets, server_id));
     }
 
     /// Drops the cached leaders of `partition_path` if it still resolves to `partition_id` of
@@ -376,6 +436,49 @@ impl Metadata {
         physical_table_paths: &HashSet<&Arc<PhysicalTablePath>>,
         partition_ids: Vec<i64>,
     ) -> Result<()> {
+        if let Some(response) = self
+            .fetch_tables_metadata(table_paths, physical_table_paths, partition_ids)
+            .await?
+        {
+            self.update(response).await?;
+        }
+        Ok(())
+    }
+
+    /// Updates lookup routing and returns the tables omitted from a successful response, which the
+    /// server does for tables the client may not describe, even if they are cached. A refresh
+    /// through the bootstrap servers only discovers servers, so it reports no table as omitted.
+    pub(crate) async fn update_lookup_metadata(
+        &self,
+        table_paths: &HashSet<&TablePath>,
+        partition_ids: Vec<PartitionId>,
+    ) -> Result<HashSet<TablePath>> {
+        let Some(response) = self
+            .fetch_tables_metadata(table_paths, &HashSet::new(), partition_ids)
+            .await?
+        else {
+            return Ok(HashSet::new());
+        };
+        let returned_tables: HashSet<TablePath> = response
+            .table_metadata
+            .iter()
+            .map(|table| from_pb_table_path(&table.table_path))
+            .collect();
+        let missing_tables = table_paths
+            .iter()
+            .filter(|path| !returned_tables.contains(*path))
+            .map(|path| (*path).clone())
+            .collect();
+        self.update(response).await?;
+        Ok(missing_tables)
+    }
+
+    async fn fetch_tables_metadata(
+        &self,
+        table_paths: &HashSet<&TablePath>,
+        physical_table_paths: &HashSet<&Arc<PhysicalTablePath>>,
+        partition_ids: Vec<PartitionId>,
+    ) -> Result<Option<MetadataResponse>> {
         let server = match self.server_for_refresh() {
             Some(s) => s,
             None => {
@@ -383,24 +486,22 @@ impl Metadata {
                     "No available tablet server to update metadata, attempting to re-initialize cluster using bootstrap server."
                 );
                 self.reinit_cluster().await?;
-                return Ok(());
+                return Ok(None);
             }
         };
 
-        let result = async {
-            let conn = self.connections.get_connection(&server).await?;
-            let response = conn
-                .request(UpdateMetadataRequest::new(
-                    table_paths,
-                    physical_table_paths,
-                    partition_ids,
-                ))
-                .await?;
-            self.update(response).await
-        }
-        .await;
+        let result = Self::request_metadata(
+            &self.connections,
+            &server,
+            UpdateMetadataRequest::new(table_paths, physical_table_paths, partition_ids),
+            self.request_timeout,
+        )
+        .await
+        .map(Some);
         if let Err(err) = &result {
-            if err.is_retriable() {
+            // A schema that is not visible yet does not make the server unavailable for other
+            // tables, or for the individual requests used to isolate a failed combined refresh.
+            if err.is_retriable() && err.api_error() != Some(FlussError::SchemaNotExist) {
                 self.unavailable_tablet_servers
                     .write()
                     .insert(server.clone());
@@ -572,7 +673,29 @@ impl Metadata {
             connections: Arc::new(RpcClient::new()),
             bootstrap: Arc::from(""),
             cluster_version_tx,
+            request_timeout: METADATA_REQUEST_TIMEOUT,
         }
+    }
+
+    pub(crate) fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
+    }
+
+    pub(crate) fn with_connections(mut self, connections: RpcClient) -> Self {
+        self.connections = Arc::new(connections);
+        self
+    }
+
+    pub(crate) fn with_bootstrap(mut self, bootstrap: &str) -> Self {
+        self.bootstrap = bootstrap.into();
+        self
+    }
+
+    pub(crate) fn with_sasl(mut self, username: &str, password: &str) -> Self {
+        self.connections =
+            Arc::new(RpcClient::new().with_sasl(username.to_string(), password.to_string()));
+        self
     }
 }
 
@@ -584,7 +707,8 @@ mod tests {
     use crate::proto::{ApiVersionsResponse, ErrorResponse, PbApiVersion, PbServerNode};
     use crate::rpc::ApiKey;
     use crate::test_utils::{
-        build_cluster_arc, pb_bucket, pb_metadata_response, pb_table_metadata,
+        build_cluster_arc, build_cluster_with_tables, pb_bucket, pb_metadata_response,
+        pb_table_metadata,
     };
     use prost::Message;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1111,6 +1235,30 @@ mod tests {
             metadata.server_for_refresh().map(|server| server.port()),
             Some(u32::from(new_port))
         );
+    }
+
+    #[test]
+    fn invalidate_physical_table_meta_skips_dropped_leaders() {
+        let table_a = TablePath::new("db".to_string(), "a".to_string());
+        let table_b = TablePath::new("db".to_string(), "b".to_string());
+        let metadata = Metadata::new_for_test(Arc::new(build_cluster_with_tables(
+            &[(&table_a, 1, 1), (&table_b, 2, 1)],
+            9092,
+        )));
+        let path_a = PhysicalTablePath::of(Arc::new(table_a));
+        let path_b = PhysicalTablePath::of(Arc::new(table_b));
+        metadata.invalidate_physical_table_meta(&HashSet::from([path_a.clone()]));
+        let cluster = metadata.get_cluster();
+        assert_eq!(leader(&cluster, 1), None);
+        let changes = metadata.subscribe_cluster_changes();
+
+        metadata.invalidate_physical_table_meta(&HashSet::from([path_a.clone()]));
+        assert!(Arc::ptr_eq(&cluster, &metadata.get_cluster()));
+        assert!(!changes.has_changed().unwrap());
+
+        metadata.invalidate_physical_table_meta(&HashSet::from([path_a, path_b]));
+        assert!(changes.has_changed().unwrap());
+        assert_eq!(leader(&metadata.get_cluster(), 2), None);
     }
 
     #[test]
