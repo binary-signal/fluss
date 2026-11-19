@@ -24,6 +24,7 @@ import org.apache.fluss.exception.InvalidConsumerGroupIdException;
 import org.apache.fluss.exception.InvalidPartitionException;
 import org.apache.fluss.exception.InvalidRequestException;
 import org.apache.fluss.fs.FsPath;
+import org.apache.fluss.metadata.GroupId;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.TableBucket;
@@ -111,8 +112,7 @@ class TabletServiceTest extends ReplicaTestBase {
         if (!empty) {
             request.getTableAt(0).getBucketAt(0).setPartitionId(-1L);
         }
-        assertThatThrownBy(() -> service.commitConsumerOffsets(request).join())
-                .cause()
+        assertThatThrownBy(() -> service.commitConsumerOffsets(request))
                 .isInstanceOf(InvalidConsumerGroupIdException.class);
         assertThat(executor.numQueuedRunnables()).isZero();
     }
@@ -129,17 +129,13 @@ class TabletServiceTest extends ReplicaTestBase {
 
         assertThat(find).isNotDone();
         assertThat(executor.numQueuedRunnables()).isOne();
-        CompletableFuture<?> unavailable = service.commitConsumerOffsets(request);
-        assertThat(unavailable).isCompletedExceptionally();
-        assertThatThrownBy(unavailable::join)
-                .cause()
+        assertThatThrownBy(() -> service.commitConsumerOffsets(request))
                 .isInstanceOf(ConsumerGroupOwnerNotAvailableException.class);
         assertThat(executor.numQueuedRunnables()).isOne();
 
         executor.triggerAll();
         assertThat(find).isCompleted();
-        assertThatThrownBy(() -> service.commitConsumerOffsets(request).join())
-                .cause()
+        assertThatThrownBy(() -> service.commitConsumerOffsets(request))
                 .isInstanceOf(InvalidPartitionException.class);
         assertCommitResult(
                 service.commitConsumerOffsets(newCommitRequest(GROUP_ID, 10L)), Errors.NONE);
@@ -232,12 +228,7 @@ class TabletServiceTest extends ReplicaTestBase {
         GetConsumerOffsetsRequest request =
                 new GetConsumerOffsetsRequest().setGroupId(GROUP_ID).setAllOffsets(true);
         request.addTable().setTableId(1L).addBucket().setBucketId(0);
-        CompletableFuture<GetConsumerOffsetsResponse> response =
-                service.getConsumerOffsets(request);
-
-        assertThat(response).isCompletedExceptionally();
-        assertThatThrownBy(response::join)
-                .cause()
+        assertThatThrownBy(() -> service.getConsumerOffsets(request))
                 .isInstanceOf(InvalidRequestException.class)
                 .hasMessageContaining("all_offsets");
     }
@@ -245,14 +236,9 @@ class TabletServiceTest extends ReplicaTestBase {
     @Test
     void testCommitBeforeFindDoesNotScheduleInitialization() throws Exception {
         TabletService service = createService();
-        CompletableFuture<CommitConsumerOffsetsResponse> response =
-                service.commitConsumerOffsets(newCommitRequest(GROUP_ID, 10L));
-
-        assertThat(executor.numQueuedRunnables()).isZero();
-        assertThat(response).isCompletedExceptionally();
-        assertThatThrownBy(response::join)
-                .cause()
+        assertThatThrownBy(() -> service.commitConsumerOffsets(newCommitRequest(GROUP_ID, 10L)))
                 .isInstanceOf(ConsumerGroupOwnerNotAvailableException.class);
+        assertThat(executor.numQueuedRunnables()).isZero();
         assertThat(zkClient.tableExist(SystemTables.CONSUMER_OFFSETS)).isFalse();
     }
 
@@ -399,7 +385,7 @@ class TabletServiceTest extends ReplicaTestBase {
         byte[] key =
                 new ConsumerOffsetSchema()
                         .encodeOffsetKey(
-                                groupId,
+                                GroupId.of(groupId),
                                 SOURCE_BUCKET.getTableId(),
                                 SOURCE_BUCKET.getPartitionId(),
                                 SOURCE_BUCKET.getBucket());
