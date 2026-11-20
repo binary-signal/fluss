@@ -727,7 +727,71 @@ class FlinkSourceSplitReaderTest extends FlinkTestBase {
         }
     }
 
+    @Test
+    void testPauseAndResumeLogSplit() throws Exception {
+        Schema schema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("name", DataTypes.STRING())
+                        .build();
+        TablePath tablePath = TablePath.of(DEFAULT_DB, "test-pause-resume-log-split");
+        long tableId =
+                createTable(
+                        tablePath,
+                        TableDescriptor.builder().schema(schema).distributedBy(1).build());
+        appendRows(tablePath, 10);
+
+        // one record per poll, so the scanner still holds fetched records when the split pauses
+        Configuration sourceConf = new Configuration(clientConf);
+        sourceConf.setInt(ConfigOptions.CLIENT_SCANNER_LOG_MAX_POLL_RECORDS, 1);
+        LogSplit split = new LogSplit(new TableBucket(tableId, 0), null, 0L);
+
+        try (FlinkSourceSplitReader splitReader =
+                new FlinkSourceSplitReader(
+                        sourceConf,
+                        tablePath,
+                        schema.getRowType(),
+                        null,
+                        null,
+                        null,
+                        createMockSourceReaderMetrics())) {
+            assignSplits(splitReader, Collections.singletonList(split));
+            List<Long> offsets = fetchOffsets(splitReader, split.splitId(), 3);
+
+            splitReader.pauseOrResumeSplits(
+                    Collections.singletonList(split), Collections.emptyList());
+            splitReader.wakeUp();
+            RecordsWithSplitIds<RecordAndPos> whilePaused = splitReader.fetch();
+            assertThat(whilePaused.nextSplit()).isNull();
+            whilePaused.recycle();
+
+            splitReader.pauseOrResumeSplits(
+                    Collections.emptyList(), Collections.singletonList(split));
+            offsets.addAll(fetchOffsets(splitReader, split.splitId(), 10 - offsets.size()));
+
+            assertThat(offsets).containsExactly(0L, 1L, 2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L);
+        }
+    }
+
     // ------------------
+
+    private List<Long> fetchOffsets(FlinkSourceSplitReader reader, String splitId, int count)
+            throws IOException {
+        List<Long> offsets = new ArrayList<>();
+        for (int fetches = 0; offsets.size() < count; fetches++) {
+            assertThat(fetches).as("fetches to read %s records", count).isLessThan(100);
+            RecordsWithSplitIds<RecordAndPos> records = reader.fetch();
+            for (String id = records.nextSplit(); id != null; id = records.nextSplit()) {
+                assertThat(id).isEqualTo(splitId);
+                RecordAndPos record;
+                while ((record = records.nextRecordFromSplit()) != null) {
+                    offsets.add(record.record().logOffset());
+                }
+            }
+            records.recycle();
+        }
+        return offsets;
+    }
 
     private void assignSplitsAndFetchUntilRetrieveRecords(
             FlinkSourceSplitReader reader,
