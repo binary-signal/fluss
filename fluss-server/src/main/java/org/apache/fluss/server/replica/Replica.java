@@ -1264,38 +1264,39 @@ public final class Replica {
         AtomicBoolean leaderHWIncremented = new AtomicBoolean(false);
         LogAppendInfo leaderAppendInfo =
                 inReadLock(
-                leaderIsrUpdateLock,
-                () -> {
-                    if (!isLeader()) {
-                        throw new NotLeaderOrFollowerException(
-                                String.format(
-                                        "Leader not local for bucket %s on tabletServer %d",
-                                        tableBucket, localTabletServerId));
-                    }
-                    // Primary-key writes must go through PUT_KV so the log and local KV state are
-                    // updated together. PRODUCE_LOG is only valid for append-only tables.
-                    if (isKvTable()) {
-                        throw new InvalidPartitionException(
-                                "Produce-log request must not target a primary-key table.");
-                    }
+                        leaderIsrUpdateLock,
+                        () -> {
+                            if (!isLeader()) {
+                                throw new NotLeaderOrFollowerException(
+                                        String.format(
+                                                "Leader not local for bucket %s on tabletServer %d",
+                                                tableBucket, localTabletServerId));
+                            }
+                            // Primary-key writes must go through PUT_KV so the log and local KV
+                            // state are
+                            // updated together. PRODUCE_LOG is only valid for append-only tables.
+                            if (isKvTable()) {
+                                throw new InvalidPartitionException(
+                                        "Produce-log request must not target a primary-key table.");
+                            }
 
-                    validateInSyncReplicaSize(requiredAcks);
+                            validateInSyncReplicaSize(requiredAcks);
 
-                    // TODO WRITE a leader epoch.
-                    LogAppendInfo appendInfo;
-                    try {
-                        appendInfo = logTablet.appendAsLeader(memoryLogRecords);
-                    } catch (IOException e) {
-                        LOG.error("Error while appending records to {}", tableBucket, e);
-                        fatalErrorHandler.onFatalError(e);
-                        throw new LogStorageException(
-                                "Error while appending records to " + tableBucket, e);
-                    }
-                    leaderHWIncremented.set(
-                            maybeIncrementLeaderHW(logTablet, clock.milliseconds()));
+                            // TODO WRITE a leader epoch.
+                            LogAppendInfo appendInfo;
+                            try {
+                                appendInfo = logTablet.appendAsLeader(memoryLogRecords);
+                            } catch (IOException e) {
+                                LOG.error("Error while appending records to {}", tableBucket, e);
+                                fatalErrorHandler.onFatalError(e);
+                                throw new LogStorageException(
+                                        "Error while appending records to " + tableBucket, e);
+                            }
+                            leaderHWIncremented.set(
+                                    maybeIncrementLeaderHW(logTablet, clock.milliseconds()));
 
-                    return appendInfo;
-                });
+                            return appendInfo;
+                        });
 
         // A write can itself publish a new high watermark, e.g. the offset of a KV flush that
         // completed just before it. The flush-complete listener then finds nothing left to
@@ -1341,37 +1342,38 @@ public final class Replica {
         AtomicBoolean leaderHWIncremented = new AtomicBoolean(false);
         LogAppendInfo leaderAppendInfo =
                 inReadLock(
-                leaderIsrUpdateLock,
-                () -> {
-                    if (!isLeader()) {
-                        throw new NotLeaderOrFollowerException(
-                                String.format(
-                                        "Leader not local for bucket %s on tabletServer %d",
-                                        tableBucket, localTabletServerId));
-                    }
-                    if (isHistoricalPartition()) {
-                        throw new InvalidPartitionException(
-                                "Normal write request must not target a historical partition.");
-                    }
+                        leaderIsrUpdateLock,
+                        () -> {
+                            if (!isLeader()) {
+                                throw new NotLeaderOrFollowerException(
+                                        String.format(
+                                                "Leader not local for bucket %s on tabletServer %d",
+                                                tableBucket, localTabletServerId));
+                            }
+                            if (isHistoricalPartition()) {
+                                throw new InvalidPartitionException(
+                                        "Normal write request must not target a historical partition.");
+                            }
 
-                    validateInSyncReplicaSize(requiredAcks);
-                    KvTablet kv = this.kvTablet;
-                    checkNotNull(
-                            kv, "KvTablet for the replica to put kv records shouldn't be null.");
-                    LogAppendInfo logAppendInfo;
-                    try {
-                        logAppendInfo = kv.putAsLeader(kvRecords, targetColumns, mergeMode);
-                    } catch (IOException e) {
-                        LOG.error("Error while putting records to {}", tableBucket, e);
-                        fatalErrorHandler.onFatalError(e);
-                        throw new KvStorageException(
-                                "Error while putting records to " + tableBucket, e);
-                    }
-                    // we may need to increment high watermark.
-                    leaderHWIncremented.set(
-                            maybeIncrementLeaderHW(logTablet, clock.milliseconds()));
-                    return logAppendInfo;
-                });
+                            validateInSyncReplicaSize(requiredAcks);
+                            KvTablet kv = this.kvTablet;
+                            checkNotNull(
+                                    kv,
+                                    "KvTablet for the replica to put kv records shouldn't be null.");
+                            LogAppendInfo logAppendInfo;
+                            try {
+                                logAppendInfo = kv.putAsLeader(kvRecords, targetColumns, mergeMode);
+                            } catch (IOException e) {
+                                LOG.error("Error while putting records to {}", tableBucket, e);
+                                fatalErrorHandler.onFatalError(e);
+                                throw new KvStorageException(
+                                        "Error while putting records to " + tableBucket, e);
+                            }
+                            // we may need to increment high watermark.
+                            leaderHWIncremented.set(
+                                    maybeIncrementLeaderHW(logTablet, clock.milliseconds()));
+                            return logAppendInfo;
+                        });
 
         // A write can itself publish a new high watermark, e.g. the offset of a KV flush that
         // completed just before it. The flush-complete listener then finds nothing left to
@@ -1414,22 +1416,23 @@ public final class Replica {
         AtomicBoolean leaderHWIncremented = new AtomicBoolean(false);
         LogAppendInfo leaderAppendInfo =
                 inReadLock(
-                leaderIsrUpdateLock,
-                () -> {
-                    validateHistoricalWrite(expectedLeaderEpoch, requiredAcks);
-                    KvTablet kv = this.kvTablet;
-                    checkNotNull(kv, "KvTablet for the historical replica shouldn't be null.");
-                    LogAppendInfo appendInfo =
-                            kv.putHistoricalAsLeader(
-                                    kvRecords,
-                                    targetColumns,
-                                    mergeMode,
-                                    originalPartitionName,
-                                    historicalValueLookup);
-                    leaderHWIncremented.set(
-                            maybeIncrementLeaderHW(logTablet, clock.milliseconds()));
-                    return appendInfo;
-                });
+                        leaderIsrUpdateLock,
+                        () -> {
+                            validateHistoricalWrite(expectedLeaderEpoch, requiredAcks);
+                            KvTablet kv = this.kvTablet;
+                            checkNotNull(
+                                    kv, "KvTablet for the historical replica shouldn't be null.");
+                            LogAppendInfo appendInfo =
+                                    kv.putHistoricalAsLeader(
+                                            kvRecords,
+                                            targetColumns,
+                                            mergeMode,
+                                            originalPartitionName,
+                                            historicalValueLookup);
+                            leaderHWIncremented.set(
+                                    maybeIncrementLeaderHW(logTablet, clock.milliseconds()));
+                            return appendInfo;
+                        });
 
         // A write can itself publish a new high watermark, e.g. the offset of a KV flush that
         // completed just before it. The flush-complete listener then finds nothing left to
