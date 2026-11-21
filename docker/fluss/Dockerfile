@@ -19,7 +19,7 @@
 # --------------
 # Stream edition
 # --------------
-FROM eclipse-temurin:17-jre-noble AS builder
+FROM eclipse-temurin:21-jdk-noble AS builder
 
 # Install dependencies
 RUN set -ex; \
