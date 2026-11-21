@@ -1261,7 +1261,9 @@ public final class Replica {
 
     public LogAppendInfo appendRecordsToLeader(MemoryLogRecords memoryLogRecords, int requiredAcks)
             throws Exception {
-        return inReadLock(
+        AtomicBoolean leaderHWIncremented = new AtomicBoolean(false);
+        LogAppendInfo leaderAppendInfo =
+                inReadLock(
                 leaderIsrUpdateLock,
                 () -> {
                     if (!isLeader()) {
@@ -1289,10 +1291,19 @@ public final class Replica {
                         throw new LogStorageException(
                                 "Error while appending records to " + tableBucket, e);
                     }
-                    maybeIncrementLeaderHW(logTablet, clock.milliseconds());
+                    leaderHWIncremented.set(
+                            maybeIncrementLeaderHW(logTablet, clock.milliseconds()));
 
                     return appendInfo;
                 });
+
+        // A write can itself publish a new high watermark, e.g. the offset of a KV flush that
+        // completed just before it. The flush-complete listener then finds nothing left to
+        // publish, so the operations waiting for that offset must be completed here.
+        if (leaderHWIncremented.get()) {
+            tryCompleteDelayedOperations();
+        }
+        return leaderAppendInfo;
     }
 
     public LogAppendInfo appendRecordsToFollower(MemoryLogRecords memoryLogRecords)
@@ -1327,7 +1338,9 @@ public final class Replica {
             MergeMode mergeMode,
             int requiredAcks)
             throws Exception {
-        return inReadLock(
+        AtomicBoolean leaderHWIncremented = new AtomicBoolean(false);
+        LogAppendInfo leaderAppendInfo =
+                inReadLock(
                 leaderIsrUpdateLock,
                 () -> {
                     if (!isLeader()) {
@@ -1355,9 +1368,18 @@ public final class Replica {
                                 "Error while putting records to " + tableBucket, e);
                     }
                     // we may need to increment high watermark.
-                    maybeIncrementLeaderHW(logTablet, clock.milliseconds());
+                    leaderHWIncremented.set(
+                            maybeIncrementLeaderHW(logTablet, clock.milliseconds()));
                     return logAppendInfo;
                 });
+
+        // A write can itself publish a new high watermark, e.g. the offset of a KV flush that
+        // completed just before it. The flush-complete listener then finds nothing left to
+        // publish, so the operations waiting for that offset must be completed here.
+        if (leaderHWIncremented.get()) {
+            tryCompleteDelayedOperations();
+        }
+        return leaderAppendInfo;
     }
 
     /**
@@ -1389,7 +1411,9 @@ public final class Replica {
         HistoricalValueLookup historicalValueLookup =
                 localLookupResult.createValueLookup(lakeLookup);
 
-        return inReadLock(
+        AtomicBoolean leaderHWIncremented = new AtomicBoolean(false);
+        LogAppendInfo leaderAppendInfo =
+                inReadLock(
                 leaderIsrUpdateLock,
                 () -> {
                     validateHistoricalWrite(expectedLeaderEpoch, requiredAcks);
@@ -1402,9 +1426,18 @@ public final class Replica {
                                     mergeMode,
                                     originalPartitionName,
                                     historicalValueLookup);
-                    maybeIncrementLeaderHW(logTablet, clock.milliseconds());
+                    leaderHWIncremented.set(
+                            maybeIncrementLeaderHW(logTablet, clock.milliseconds()));
                     return appendInfo;
                 });
+
+        // A write can itself publish a new high watermark, e.g. the offset of a KV flush that
+        // completed just before it. The flush-complete listener then finds nothing left to
+        // publish, so the operations waiting for that offset must be completed here.
+        if (leaderHWIncremented.get()) {
+            tryCompleteDelayedOperations();
+        }
+        return leaderAppendInfo;
     }
 
     /**
